@@ -1,0 +1,54 @@
+{
+  "id": "openclaw-memory-qdrant-v2",
+  "kind": "memory",
+  "name": "Memory (Qdrant) V2",
+  "version": "2.0.0",
+  "description": "增强版语义记忆系统：importance 自动分级、加权搜索、关键词搜索、噪音过滤",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "qdrantUrl": {
+        "type": "string",
+        "description": "Qdrant 服务地址（留空使用内存模式）"
+      },
+      "persistToDisk": {
+        "type": "boolean",
+        "default": true,
+        "description": "Save memories to disk in memory mode"
+      },
+      "storagePath": {
+        "type": "string",
+        "description": "Custom storage path for disk persistence"
+      },
+      "collectionName": {
+        "type": "string",
+        "default": "openclaw_memories"
+      },
+      "autoCapture": {
+        "type": "boolean",
+        "default": false
+      },
+      "allowPIICapture": {
+        "type": "boolean",
+        "default": false
+      },
+      "autoRecall": {
+        "type": "boolean",
+        "default": true
+      },
+      "captureMaxChars": {
+        "type": "number",
+        "minimum": 100,
+        "maximum": 10000,
+        "default": 5000
+      },
+      "maxMemorySize": {
+        "type": "number",
+        "minimum": 100,
+        "maximum": 1000000,
+        "default": 1000
+      }
+    }
+  }
+}
