@@ -1,14 +1,26 @@
 """
-Qdrant Memory MCP Server V2.1
-基于 V2 增强：store 时向量去重检查、delete 支持语义模糊删除
-向后兼容 v2/v1 数据
+Qdrant Memory MCP Server V3
+基于 V2.1，升级 embedding 模型：
+  bge-small-zh-v1.5 (512维, 本地) → text-embedding-v4 (1024维, 阿里云API)
+
+改进：
+- 语义理解大幅提升（大模型级别 vs 小模型）
+- 长文本支持 8192 Token（原 512）
+- 支持 query/document 区分优化检索
+- 新 collection claude-memory-v3，不影响旧数据
 """
+
+import os
+
+# 防止 httpx/qdrant 走系统代理连接本地 Qdrant
+os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1")
+os.environ.setdefault("no_proxy", "localhost,127.0.0.1")
 
 import hashlib
 import time
 from datetime import datetime
 
-from fastembed import TextEmbedding
+import httpx
 from mcp.server.fastmcp import FastMCP
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
@@ -26,9 +38,13 @@ from qdrant_client.models import (
 
 # ── 配置 ──────────────────────────────────────────────
 QDRANT_URL = "http://localhost:6333"
-COLLECTION_NAME = "claude-memory"
-EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
-VECTOR_DIM = 512
+COLLECTION_NAME = "claude-memory-v3"
+VECTOR_DIM = 1024
+
+# 阿里云百炼 Embedding API
+DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
+EMBEDDING_MODEL = "text-embedding-v4"
+EMBEDDING_API_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings"
 
 # importance 权重
 IMPORTANCE_WEIGHTS = {
@@ -52,9 +68,38 @@ CATEGORY_IMPORTANCE = {
 # 去重阈值
 DEDUP_THRESHOLD = 0.92
 
-# ── 初始化 ─────────────────────────────────────────────
+# ── Embedding 客户端 ─────────────────────────────────
+_http_client = httpx.Client(timeout=30)
+
+
+def get_embedding(text: str, text_type: str = "document") -> list[float]:
+    """调用阿里云 text-embedding-v4 生成向量。
+
+    Args:
+        text: 输入文本
+        text_type: "query" 用于搜索查询，"document" 用于存储文档
+    """
+    resp = _http_client.post(
+        EMBEDDING_API_URL,
+        headers={
+            "Authorization": f"Bearer {DASHSCOPE_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": EMBEDDING_MODEL,
+            "input": text,
+            "dimensions": VECTOR_DIM,
+            "encoding_format": "float",
+            "extra_body": {"text_type": text_type},
+        },
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data["data"][0]["embedding"]
+
+
+# ── Qdrant 初始化 ────────────────────────────────────
 client = QdrantClient(url=QDRANT_URL, timeout=30, check_compatibility=False)
-embedding_model = TextEmbedding(model_name=EMBEDDING_MODEL)
 
 
 def ensure_collection():
@@ -67,78 +112,47 @@ def ensure_collection():
         )
 
     # 建立 payload 索引（幂等操作，已存在则跳过）
-    try:
-        client.create_payload_index(
-            collection_name=COLLECTION_NAME,
-            field_name="content",
-            field_schema=TextIndexParams(
-                type="text",
-                tokenizer=TokenizerType.MULTILINGUAL,
-                min_token_len=2,
-                max_token_len=20,
-            ),
-        )
-    except Exception:
-        pass
-
-    try:
-        client.create_payload_index(
-            collection_name=COLLECTION_NAME,
-            field_name="tags",
-            field_schema=TextIndexParams(
-                type="text",
-                tokenizer=TokenizerType.MULTILINGUAL,
-                min_token_len=2,
-                max_token_len=20,
-            ),
-        )
-    except Exception:
-        pass
-
-    try:
-        client.create_payload_index(
-            collection_name=COLLECTION_NAME,
-            field_name="category",
-            field_schema="keyword",
-        )
-    except Exception:
-        pass
-
-    try:
-        client.create_payload_index(
-            collection_name=COLLECTION_NAME,
-            field_name="importance",
-            field_schema="keyword",
-        )
-    except Exception:
-        pass
-
-    try:
-        client.create_payload_index(
-            collection_name=COLLECTION_NAME,
-            field_name="created_at",
-            field_schema="keyword",
-        )
-    except Exception:
-        pass
-
-    try:
-        client.create_payload_index(
-            collection_name=COLLECTION_NAME,
-            field_name="timestamp",
-            field_schema="integer",
-        )
-    except Exception:
-        pass
+    for field, schema in [
+        ("content", TextIndexParams(
+            type="text",
+            tokenizer=TokenizerType.MULTILINGUAL,
+            min_token_len=2,
+            max_token_len=20,
+        )),
+        ("tags", TextIndexParams(
+            type="text",
+            tokenizer=TokenizerType.MULTILINGUAL,
+            min_token_len=2,
+            max_token_len=20,
+        )),
+        ("category", "keyword"),
+        ("importance", "keyword"),
+        ("created_at", "keyword"),
+        ("timestamp", "integer"),
+    ]:
+        try:
+            client.create_payload_index(
+                collection_name=COLLECTION_NAME,
+                field_name=field,
+                field_schema=schema,
+            )
+        except Exception:
+            pass
 
 
 ensure_collection()
 
 mcp = FastMCP(
-    "Claude Memory V2.1",
+    "Claude Memory V3",
     instructions="""
-这是 Claude 的永久向量记忆系统 V2.1。改进：
+这是 Claude 的永久向量记忆系统 V3。升级：embedding 模型从本地小模型升级为阿里云 text-embedding-v4。
 
+改进：
+- 语义理解大幅提升（大模型级 embedding）
+- 长文本支持 8192 Token（原 512）
+- query/document 区分优化检索准确度
+
+工具：
 1. **store_memory**: 存储记忆，自动去重（相似度>0.92自动跳过），自动 importance 分级
 2. **search_memory**: 智能搜索，向量语义 + 重要性加权 + 去重
 3. **keyword_search**: 精确关键词搜索，适合搜特定术语、项目名、工具名
@@ -152,12 +166,6 @@ mcp = FastMCP(
 - 找不到时两个都试试
 """,
 )
-
-
-def get_embedding(text: str) -> list[float]:
-    """使用本地 bge-small-zh 模型生成向量。"""
-    embeddings = list(embedding_model.embed([text]))
-    return embeddings[0].tolist()
 
 
 def make_id(content: str) -> str:
@@ -198,7 +206,7 @@ def deduplicate(results: list, threshold: float = DEDUP_THRESHOLD) -> list:
 
 @mcp.tool()
 def store_memory(content: str, category: str = "general", tags: str = "") -> str:
-    """存储一条记忆到永久向量数据库（V2.1 增强版，自动去重）。
+    """存储一条记忆到永久向量数据库（V3，text-embedding-v4）。
 
     Args:
         content: 要记住的内容，尽量描述清楚上下文
@@ -206,9 +214,9 @@ def store_memory(content: str, category: str = "general", tags: str = "") -> str
         tags: 逗号分隔的标签，如 "python,react,中国象棋"
     """
     importance = get_importance(category)
-    embedding = get_embedding(content)
+    embedding = get_embedding(content, text_type="document")
 
-    # ── V2.1 新增：store 前去重检查 ──
+    # 去重检查
     existing = client.query_points(
         collection_name=COLLECTION_NAME,
         query=embedding,
@@ -231,7 +239,7 @@ def store_memory(content: str, category: str = "general", tags: str = "") -> str
         "importance": importance,
         "created_at": datetime.now().isoformat(),
         "timestamp": int(time.time()),
-        "version": "v2.1",
+        "version": "v3",
     }
     client.upsert(
         collection_name=COLLECTION_NAME,
@@ -255,7 +263,7 @@ def search_memory(query: str, category: str = "", top_k: int = 5) -> str:
         category: 可选，限定搜索分类
         top_k: 返回结果数量，默认5条
     """
-    embedding = get_embedding(query)
+    embedding = get_embedding(query, text_type="query")
 
     fetch_k = top_k * 3
 
@@ -381,8 +389,7 @@ def delete_memory(content: str = "", query: str = "") -> str:
         )
         return f"记忆已精确删除 [ID: {memory_id[:8]}]"
 
-    # ── V2.1 新增：语义模糊删除 ──
-    embedding = get_embedding(query)
+    embedding = get_embedding(query, text_type="query")
     results = client.query_points(
         collection_name=COLLECTION_NAME,
         query=embedding,
@@ -473,7 +480,6 @@ def search_openclaw_memory(keyword: str) -> str:
         importance = payload.get("importance_level", "")
         raw_ts = payload.get("createdAt")
         if raw_ts and isinstance(raw_ts, (int, float)):
-            from datetime import datetime
             created_at = datetime.fromtimestamp(raw_ts / 1000).strftime("%Y-%m-%d %H:%M")
         else:
             created_at = str(raw_ts or "")[:10]

@@ -1,0 +1,58 @@
+{
+  "id": "openclaw-memory-qdrant-v3",
+  "kind": "memory",
+  "name": "Memory (Qdrant) V3",
+  "version": "3.0.0",
+  "description": "V3 语义记忆系统：阿里云 text-embedding-v4 (1024维)，8192 token 长文本，importance 分级，加权搜索",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "qdrantUrl": {
+        "type": "string",
+        "description": "Qdrant 服务地址（留空使用内存模式）"
+      },
+      "persistToDisk": {
+        "type": "boolean",
+        "default": true,
+        "description": "Save memories to disk in memory mode"
+      },
+      "storagePath": {
+        "type": "string",
+        "description": "Custom storage path for disk persistence"
+      },
+      "collectionName": {
+        "type": "string",
+        "default": "openclaw_memories_v3"
+      },
+      "autoCapture": {
+        "type": "boolean",
+        "default": false
+      },
+      "allowPIICapture": {
+        "type": "boolean",
+        "default": false
+      },
+      "autoRecall": {
+        "type": "boolean",
+        "default": true
+      },
+      "captureMaxChars": {
+        "type": "number",
+        "minimum": 100,
+        "maximum": 10000,
+        "default": 5000
+      },
+      "maxMemorySize": {
+        "type": "number",
+        "minimum": 100,
+        "maximum": 1000000,
+        "default": 1000
+      },
+      "dashscopeApiKey": {
+        "type": "string",
+        "description": "阿里云 DashScope API Key（也可通过 DASHSCOPE_API_KEY 环境变量设置）"
+      }
+    }
+  }
+}
