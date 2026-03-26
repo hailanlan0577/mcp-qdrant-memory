@@ -1,4 +1,4 @@
-# 统一记忆系统 v3.0
+# 统一记忆系统 v3.5
 
 基于 Qdrant 向量数据库 + Graphiti 知识图谱的 AI 永久记忆系统。Claude Code（MCP Server）和 OpenClaw（飞书插件）双端接入，统一集合，记忆双向互通。
 
@@ -180,7 +180,18 @@ autoCapture 关键处理：
 
 ---
 
-## v3.0 核心升级
+## v3.5 核心升级（相对 v3.0）
+
+| | v3.0 | v3.5 |
+|---|---|---|
+| **知识图谱** | 无 | **Graphiti (Neo4j)，自动实体提取和关系建立** |
+| **融合搜索** | 无 | **hybrid_search (Qdrant + Graphiti 并行)** |
+| **集合** | 分离 (claude-memory-v3 + openclaw_memories_v3) | **统一 (unified_memories_v3)** |
+| **autoCapture** | 直接存 userText（含注入标签） | **stripInjectedTags 后存 cleanText** |
+| **Graphiti 协议** | 无 | **Streamable HTTP (POST /mcp + Mcp-Session-Id)** |
+| **存档恢复** | 无 | **healthcheck.sh + save_restore.sh** |
+
+## v3.0 vs v2.3
 
 | | v2.3 | v3.0 |
 |---|---|---|
@@ -342,14 +353,20 @@ git checkout <commit>     # 回滚
 
 ## 版本历史
 
-### v3.0 (2026-03-20) — 当前版本
+### v3.5 (2026-03-26) — 当前版本
+
+- **Graphiti 知识图谱集成**: 双写 Qdrant + Graphiti，自动实体提取和关系建立
+- **hybrid_search 融合搜索**: Qdrant 向量 + Graphiti 图谱并行查询，统一返回
+- **统一集合**: `unified_memories_v3`，Claude Code 和 OpenClaw 共享，source 字段区分
+- **Streamable HTTP**: hybrid_search 内部调 Graphiti 从 SSE 改为 HTTP 协议
+- **autoCapture 修复**: stripInjectedTags 剥离 recall 注入标签，防止 dedup 误判
+- **存档恢复**: healthcheck.sh（Claude Code）+ save_restore.sh（Mac Mini）
+
+### v3.0 (2026-03-20)
 
 - **Embedding 升级**: 阿里云 text-embedding-v4, 1024维, 8192 Token
-- **统一集合**: `unified_memories_v3`，Claude Code 和 OpenClaw 共享
-- **Graphiti 知识图谱**: 实体提取、关系建立、时序推理
-- **hybrid_search**: Qdrant + Graphiti 融合搜索
-- **Streamable HTTP**: hybrid_search 内部调 Graphiti 从 SSE 改为 HTTP
-- **autoCapture 修复**: stripInjectedTags 防止 recall 注入导致 dedup 误判
+- **新集合**: claude-memory-v3 + openclaw_memories_v3
+- **query/document 区分**: 搜索用 query 类型，存储用 document 类型
 
 ### v2.3 (2026-03-19)
 
