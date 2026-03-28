@@ -1126,5 +1126,112 @@ def global_search(query: str, top_k: int = 5) -> str:
     return f"{claude_section}\n\n---\n\n{openclaw_section}"
 
 
+# ── 多模态搜索 ─────────────────────────────────────────
+
+MULTIMODAL_COLLECTION = "multimodal_memories"
+MULTIMODAL_MODEL = "tongyi-embedding-vision-plus-2026-03-06"
+MULTIMODAL_API_URL = "https://dashscope.aliyuncs.com/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding"
+MULTIMODAL_DIM = 1024
+
+
+def get_multimodal_embedding(text: str) -> list[float]:
+    """通过多模态模型编码纯文本 query（确保与融合向量在同一空间）。"""
+    resp = _http_client.post(
+        MULTIMODAL_API_URL,
+        headers={
+            "Authorization": f"Bearer {DASHSCOPE_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": MULTIMODAL_MODEL,
+            "input": {"contents": [{"text": text}]},
+            "parameters": {"dimension": MULTIMODAL_DIM},
+        },
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data["output"]["embeddings"][0]["embedding"]
+
+
+def ensure_multimodal_collection() -> bool:
+    """确保多模态 collection 存在并建立索引，返回是否可用。"""
+    try:
+        collections = [c.name for c in client.get_collections().collections]
+        if MULTIMODAL_COLLECTION not in collections:
+            client.create_collection(
+                collection_name=MULTIMODAL_COLLECTION,
+                vectors_config=VectorParams(size=MULTIMODAL_DIM, distance=Distance.COSINE),
+            )
+        for field, schema in [
+            ("has_image", "keyword"),
+            ("image_key", "keyword"),
+            ("source", "keyword"),
+            ("sender", "keyword"),
+            ("tags", TextIndexParams(
+                type="text",
+                tokenizer=TokenizerType.MULTILINGUAL,
+                min_token_len=2,
+                max_token_len=20,
+            )),
+        ]:
+            try:
+                client.create_payload_index(
+                    MULTIMODAL_COLLECTION, field_name=field, field_schema=schema,
+                )
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+
+
+@mcp.tool()
+def search_multimodal_memory(query: str, top_k: int = 5) -> str:
+    """搜索多模态记忆（文搜图）。用文字描述查找包含图片的记忆。
+
+    适用于：根据文字描述搜索包包图片、查找之前发过的图文消息等。
+    向量空间与纯文本记忆不同，此工具专搜多模态融合向量。
+
+    Args:
+        query: 搜索内容，用自然语言描述你想找的图文内容
+        top_k: 返回结果数量，默认5条
+    """
+    if not ensure_multimodal_collection():
+        return "多模态 collection 不可用。"
+
+    try:
+        embedding = get_multimodal_embedding(query)
+    except Exception as e:
+        return f"多模态 embedding 生成失败: {e}"
+
+    results = client.query_points(
+        collection_name=MULTIMODAL_COLLECTION,
+        query=embedding,
+        limit=top_k,
+        with_payload=True,
+    )
+
+    if not results.points:
+        return "没有找到相关的多模态记忆。"
+
+    memories = []
+    for point in results.points:
+        payload = point.payload
+        score = point.score
+        content = payload.get("content", payload.get("text", ""))
+        has_image = payload.get("has_image", "false")
+        image_key = payload.get("image_key", "")
+        tags = payload.get("tags", "")
+        created_at = payload.get("created_at", "")[:10]
+
+        img_tag = "🖼️" if has_image == "true" else "📝"
+        memories.append(
+            f"[{img_tag} {score:.2f}] {content}\n"
+            f"  image_key: {image_key} | 标签: {tags} | 时间: {created_at}"
+        )
+
+    return "\n\n".join(memories)
+
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")

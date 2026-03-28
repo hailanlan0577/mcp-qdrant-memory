@@ -30,6 +30,12 @@ const SIMILARITY_THRESHOLDS = {
 const EMBEDDING_MODEL = 'text-embedding-v4';
 const EMBEDDING_API_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings';
 
+// 多模态融合向量
+const MULTIMODAL_MODEL = 'tongyi-embedding-vision-plus-2026-03-06';
+const MULTIMODAL_API_URL = 'https://dashscope.aliyuncs.com/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding';
+const MULTIMODAL_DIM = 1024;
+const MULTIMODAL_COLLECTION = 'multimodal_memories';
+
 // importance 自动映射
 const CATEGORY_IMPORTANCE = {
   architecture: 'high',
@@ -63,6 +69,120 @@ function isNoiseContent(text) {
   if (!text || typeof text !== 'string') return false;
   const trimmed = text.trim();
   return NOISE_PATTERNS.some(pattern => pattern.test(trimmed));
+}
+
+// ============================================================================
+// 飞书图片下载
+// ============================================================================
+
+const FEISHU_TOKEN_URL = 'https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal';
+const FEISHU_IMAGE_URL = 'https://open.feishu.cn/open-apis/im/v1/images';
+
+let _feishuTokenCache = { token: null, expiresAt: 0 };
+
+async function getFeishuTenantToken(appId, appSecret) {
+  if (_feishuTokenCache.token && Date.now() < _feishuTokenCache.expiresAt) {
+    return _feishuTokenCache.token;
+  }
+
+  const resp = await fetch(FEISHU_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
+  });
+
+  if (!resp.ok) {
+    throw new Error(`飞书 token 获取失败: ${resp.status}`);
+  }
+
+  const data = await resp.json();
+  if (data.code !== 0) {
+    throw new Error(`飞书 token 错误: ${data.msg}`);
+  }
+
+  _feishuTokenCache = {
+    token: data.tenant_access_token,
+    expiresAt: Date.now() + (data.expire - 300) * 1000, // 提前 5 分钟刷新
+  };
+  return _feishuTokenCache.token;
+}
+
+/**
+ * 下载飞书图片并转为 Base64 data URI
+ * @param {string} imageKey - 飞书 image_key
+ * @param {string} token - tenant_access_token
+ * @returns {Promise<string|null>} data:image/...;base64,... 格式，失败返回 null
+ */
+async function downloadFeishuImage(imageKey, token, logger) {
+  const url = `${FEISHU_IMAGE_URL}/${imageKey}?image_type=message`;
+  const resp = await fetch(url, {
+    headers: { 'Authorization': `Bearer ${token}` },
+  });
+
+  if (!resp.ok) {
+    let body = '';
+    try { body = await resp.text(); } catch (_) {}
+    if (logger) logger.warn(`memory-qdrant-v3: 飞书图片下载 HTTP ${resp.status} for ${imageKey}: ${body.slice(0, 300)}`);
+    return null;
+  }
+
+  const contentType = resp.headers.get('content-type') || '';
+  const ALLOWED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/bmp', 'image/tiff'];
+  if (!ALLOWED_IMAGE_TYPES.some(t => contentType.startsWith(t))) {
+    return null;
+  }
+
+  const buffer = Buffer.from(await resp.arrayBuffer());
+
+  // 超过 5MB 跳过
+  if (buffer.length > 5 * 1024 * 1024) {
+    return null;
+  }
+
+  return `data:${contentType};base64,${buffer.toString('base64')}`;
+}
+
+/**
+ * 从消息中提取文本和图片信息
+ * @param {Object} msg - OpenClaw 消息对象
+ * @returns {{ texts: string[], imageKeys: string[] }}
+ */
+function extractContent(msg) {
+  const result = { texts: [], imageKeys: [] };
+  if (!msg || typeof msg !== 'object') return result;
+
+  const content = msg.content;
+  if (typeof content === 'string') {
+    // 尝试解析 {"image_key":"..."} 格式
+    try {
+      const parsed = JSON.parse(content);
+      if (parsed.image_key) {
+        result.imageKeys.push(parsed.image_key);
+        return result;
+      }
+    } catch {}
+    // image_key 裸字符串模式: img_v3_...
+    if (/^img_v\d+_/.test(content.trim())) {
+      result.imageKeys.push(content.trim());
+      return result;
+    }
+    result.texts.push(content);
+    return result;
+  }
+
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (!block || typeof block !== 'object') continue;
+      if (block.type === 'text' && block.text) {
+        result.texts.push(block.text);
+      } else if (block.type === 'image') {
+        const key = block.image_key || block.key || block.url;
+        if (key) result.imageKeys.push(key);
+      }
+    }
+  }
+
+  return result;
 }
 
 // ============================================================================
@@ -252,15 +372,14 @@ class MemoryDB {
     const id = randomUUID();
     const now = Date.now();
     const nowISO = new Date(now).toISOString().slice(0, 10);
+    const { vector, ...rest } = entry;
     await this.client.upsert(this.collectionName, {
       points: [{
         id,
-        vector: entry.vector,
+        vector,
         payload: {
-          text: entry.text,
-          category: entry.category,
-          importance: entry.importance,
-          importance_level: entry.importance_level || 'medium',
+          ...rest,
+          importance_level: rest.importance_level || 'medium',
           createdAt: now,
           timestamp: now,
           created_at: nowISO,
@@ -491,6 +610,55 @@ class Embeddings {
   async embedDocument(text) {
     return this.embed(text, 'document');
   }
+
+  // ---- 多模态融合向量 ----
+
+  /**
+   * 生成多模态融合向量（图文合一）
+   * @param {Object} options
+   * @param {string} [options.text] - 文本内容
+   * @param {string} [options.image] - 图片 URL 或 data:image/...;base64,... 格式
+   * @returns {Promise<number[]>} 1024 维融合向量
+   */
+  async embedMultimodal({ text, image } = {}) {
+    if (!text && !image) {
+      throw new Error('embedMultimodal: 至少需要 text 或 image');
+    }
+
+    const content = {};
+    if (text) content.text = text;
+    if (image) content.image = image;
+
+    const resp = await fetch(MULTIMODAL_API_URL, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${this.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: MULTIMODAL_MODEL,
+        input: { contents: [content] },
+        parameters: { dimension: MULTIMODAL_DIM },
+      }),
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Multimodal Embedding API failed: ${resp.status} ${errText}`);
+    }
+
+    const data = await resp.json();
+    const output = data?.output?.embeddings?.[0]?.embedding;
+    if (!output) {
+      throw new Error(`Multimodal Embedding: 响应格式异常 ${JSON.stringify(data).slice(0, 200)}`);
+    }
+    return output;
+  }
+
+  /** 多模态搜索用：纯文本 query 通过多模态模型编码（保证同一向量空间） */
+  async embedMultimodalQuery(text) {
+    return this.embedMultimodal({ text });
+  }
 }
 
 // ============================================================================
@@ -597,6 +765,16 @@ export default function register(api) {
   const db = new MemoryDB(cfg.qdrantUrl, cfg.collectionName || 'openclaw_memories_v3', maxSize, persistPath);
   const embeddings = new Embeddings(dashscopeApiKey);
 
+  // 多模态 MemoryDB（独立 collection，向量空间不兼容）
+  const multimodalEnabled = cfg.multimodalEnabled && cfg.qdrantUrl;
+  const mmDb = multimodalEnabled
+    ? new MemoryDB(cfg.qdrantUrl, MULTIMODAL_COLLECTION, maxSize)
+    : null;
+
+  // 飞书凭证（多模态图片下载需要）
+  const feishuAppId = cfg.feishuAppId || process.env.FEISHU_APP_ID || '';
+  const feishuAppSecret = cfg.feishuAppSecret || process.env.FEISHU_APP_SECRET || '';
+
   if (db.useMemoryFallback) {
     api.logger.info('memory-qdrant-v3: using in-memory storage');
   } else {
@@ -612,7 +790,35 @@ export default function register(api) {
     });
   }
 
-  api.logger.info('memory-qdrant-v3: plugin registered (V3 text-embedding-v4)');
+  if (multimodalEnabled) {
+    if (!feishuAppId || !feishuAppSecret) {
+      api.logger.warn('memory-qdrant-v3: multimodal 已启用但飞书凭证未配置，图片下载将不可用');
+    }
+    mmDb.ensureCollection().then(async () => {
+      // 多模态专用索引
+      const mmIndexes = [
+        { field: 'has_image', schema: 'keyword' },
+        { field: 'image_key', schema: 'keyword' },
+        { field: 'source', schema: 'keyword' },
+        { field: 'sender', schema: 'keyword' },
+        { field: 'chat_id', schema: 'keyword' },
+        { field: 'tags', schema: { type: 'text', tokenizer: 'multilingual', min_token_len: 2, max_token_len: 20 } },
+      ];
+      for (const idx of mmIndexes) {
+        try {
+          await mmDb.client.createPayloadIndex(MULTIMODAL_COLLECTION, {
+            field_name: idx.field,
+            field_schema: idx.schema,
+          });
+        } catch {}
+      }
+      api.logger.info(`memory-qdrant-v3: multimodal collection '${MULTIMODAL_COLLECTION}' ready (${MULTIMODAL_DIM}维)`);
+    }).catch(err => {
+      api.logger.error(`memory-qdrant-v3: multimodal collection 初始化失败: ${err.message}`);
+    });
+  }
+
+  api.logger.info('memory-qdrant-v3: plugin registered (V3 text-embedding-v4' + (multimodalEnabled ? ' + multimodal' : '') + ')');
 
   // ==========================================================================
   // AI 工具
@@ -911,6 +1117,53 @@ export default function register(api) {
     };
   }
 
+  // 多模态搜索工具（文字搜图片）
+  function createMultimodalSearchTool() {
+    return {
+      name: 'memory_multimodal_search',
+      description: '用文字搜索多模态记忆（图片+文本），支持以文搜图。使用多模态向量空间。',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: '搜索查询（自然语言描述你想找的图片）' },
+          limit: { type: 'number', description: '最大结果数（默认 5）' }
+        },
+        required: ['query']
+      },
+      execute: async function(_id, params) {
+        if (!mmDb) {
+          return { content: [{ type: 'text', text: JSON.stringify({ success: false, message: '多模态记忆未启用' }) }] };
+        }
+        const { query, limit = 5 } = params;
+        const vector = await embeddings.embedMultimodalQuery(query);
+        const results = await mmDb.search(vector, limit, 0.05);
+
+        if (results.length === 0) {
+          return { content: [{ type: 'text', text: JSON.stringify({ success: true, message: '未找到相关多模态记忆', count: 0 }) }] };
+        }
+
+        const text = results.map((r, i) => {
+          const e = r.entry;
+          return `${i + 1}. [相似度 ${(r.score * 100).toFixed(0)}%] image_key: ${e.image_key || 'N/A'}\n   文本: ${(e.text || '').slice(0, 100)}\n   发送者: ${e.sender || '?'} | 日期: ${e.created_at || '?'}`;
+        }).join('\n\n');
+
+        return { content: [{ type: 'text', text: JSON.stringify({
+          success: true,
+          message: `找到 ${results.length} 条多模态记忆:\n\n${text}`,
+          count: results.length,
+          memories: results.map(r => ({
+            id: r.entry.id,
+            text: r.entry.text,
+            image_key: r.entry.image_key,
+            sender: r.entry.sender,
+            score: r.score,
+            created_at: r.entry.created_at,
+          }))
+        }) }] };
+      }
+    };
+  }
+
   // 注册工具
   const tools = [
     createMemoryStoreTool(),
@@ -919,6 +1172,7 @@ export default function register(api) {
     createMemoryStatsTool(),
     createMemoryForgetTool(),
     createSearchClaudeMemoryTool(),
+    ...(mmDb ? [createMultimodalSearchTool()] : []),
   ];
 
   for (const tool of tools) {
@@ -1092,15 +1346,147 @@ export default function register(api) {
           } catch (_) {}
         }
 
-        if (scored.length === 0) return;
+        // 多模态搜索：检测到包包/库存/外观相关查询时，自动搜索图片记忆并注入
+        let multimodalContext = '';
+        if (mmDb) {
+          const bagPatterns = /包|bag|handbag|红色|蓝色|黑色|白色|粉色|绿色|棕色|颜色|库存|有什么|有哪些|Chanel|LV|Hermes|Gucci|Dior|Prada/i;
+          if (bagPatterns.test(event.prompt)) {
+            try {
+              const mmVector = await embeddings.embedMultimodalQuery(event.prompt);
+              const mmResults = await mmDb.search(mmVector, 3, 0.05);
+              if (mmResults.length > 0) {
+                const mmLines = mmResults.map((r, i) => {
+                  const e = r.entry;
+                  return `${i + 1}. [相似度 ${(r.score * 100).toFixed(0)}%] ${e.text || '(仅图片)'} | 发送者: ${e.sender || '?'} | image_key: ${e.image_key || 'N/A'}`;
+                });
+                multimodalContext = `\n<multimodal-memory>\n以下是多模态图片记忆中与查询相关的结果：\n${mmLines.join('\n')}\n</multimodal-memory>`;
+                api.logger.info(`memory-qdrant-v3: 注入 ${mmResults.length} 条多模态记忆`);
+              }
+            } catch (mmErr) {
+              api.logger.warn(`memory-qdrant-v3: 多模态recall失败: ${mmErr.message}`);
+            }
+          }
+        }
 
-        api.logger.debug(`memory-qdrant-v3: 注入 ${scored.length} 条记忆（加权排序，最高分 ${bestScore.toFixed(2)}）`);
+        if (scored.length === 0 && !multimodalContext) return;
+
+        const textContext = scored.length > 0 ? formatRelevantMemoriesContext(scored) : '';
+        api.logger.debug(`memory-qdrant-v3: 注入 ${scored.length} 条文本记忆${multimodalContext ? ' + 多模态记忆' : ''}（最高分 ${bestScore.toFixed(2)}）`);
 
         return {
-          prependContext: formatRelevantMemoriesContext(scored)
+          prependContext: textContext + multimodalContext
         };
       } catch (err) {
         api.logger.warn(`memory-qdrant-v3: recall 失败: ${err.message}`);
+      }
+    });
+  }
+
+  // ==========================================================================
+  // 图片消息自动捕获（message_received，不需要 @机器人）
+  // ==========================================================================
+  const capturedImageKeys = new Set();
+  // 定期清理过期 key（防止内存泄漏）
+  setInterval(() => capturedImageKeys.clear(), 3600_000);
+
+  if (multimodalEnabled && mmDb && feishuAppId && feishuAppSecret) {
+    api.logger.info('memory-qdrant-v3: image autoCapture via message_received enabled');
+    api.on('message_received', async (event, ctx) => {
+      try {
+        // 只处理飞书渠道的消息
+        const channel = event.metadata?.originatingChannel || '';
+        if (!channel.includes('feishu')) return;
+
+        // 提取内容（适配 extractContent 接口）
+        const parsed = extractContent({ content: event.content });
+        if (parsed.imageKeys.length === 0) return; // 没有图片，跳过
+
+        const imageKey = parsed.imageKeys[0];
+        if (parsed.imageKeys.length > 1) {
+          api.logger.info(`memory-qdrant-v3: 消息含 ${parsed.imageKeys.length} 张图，仅处理第一张`);
+        }
+
+        // 去重：同一张图不重复处理
+        if (capturedImageKeys.has(imageKey)) return;
+
+        const text = parsed.texts.join(' ').trim();
+        const sender = event.metadata?.senderName || event.from || 'unknown';
+        const chatId = ctx?.conversationId || event.metadata?.threadId || '';
+
+        api.logger.info(`memory-qdrant-v3: [message_received] 检测到图片 ${imageKey} from ${sender}`);
+
+        // 通过飞书 Message Resources API 下载图片
+        const messageId = event.metadata?.messageId || '';
+        const token = await getFeishuTenantToken(feishuAppId, feishuAppSecret);
+        let imageData = null;
+
+        if (messageId) {
+          // 优先使用 message resources API（兼容 img_v3_ 格式）
+          const resUrl = `https://open.feishu.cn/open-apis/im/v1/messages/${messageId}/resources/${imageKey}?type=image`;
+          try {
+            const resResp = await fetch(resUrl, {
+              headers: { 'Authorization': `Bearer ${token}` },
+            });
+            if (resResp.ok) {
+              const ct = resResp.headers.get('content-type') || 'image/jpeg';
+              const buf = Buffer.from(await resResp.arrayBuffer());
+              if (buf.length > 0 && buf.length <= 5 * 1024 * 1024) {
+                imageData = `data:${ct};base64,${buf.toString('base64')}`;
+                api.logger.info(`memory-qdrant-v3: 图片下载成功 via resources API (${(buf.length / 1024).toFixed(0)}KB)`);
+              }
+            } else {
+              let body = '';
+              try { body = await resResp.text(); } catch (_) {}
+              api.logger.warn(`memory-qdrant-v3: resources API HTTP ${resResp.status}: ${body.slice(0, 200)}`);
+            }
+          } catch (resErr) {
+            api.logger.warn(`memory-qdrant-v3: resources API 请求失败: ${resErr.message}`);
+          }
+        }
+
+        // fallback: 通过飞书 images API 下载
+        if (!imageData) {
+          imageData = await downloadFeishuImage(imageKey, token, api.logger);
+        }
+
+        if (!imageData) {
+          api.logger.warn(`memory-qdrant-v3: 图片下载失败 ${imageKey}`);
+          return;
+        }
+
+        // 生成多模态融合向量
+        const vector = await embeddings.embedMultimodal({
+          text: text || undefined,
+          image: imageData,
+        });
+
+        // Qdrant 去重检查
+        const existing = await mmDb.search(vector, 1, SIMILARITY_THRESHOLDS.DUPLICATE);
+        if (existing.length > 0) {
+          api.logger.info(`memory-qdrant-v3: 多模态去重命中，跳过 ${imageKey}`);
+          capturedImageKeys.add(imageKey);
+          return;
+        }
+
+        // 存入 multimodal_memories
+        await mmDb.store({
+          text: text || `[图片] ${imageKey}`,
+          vector,
+          category: 'multimodal',
+          importance: 0.9,
+          importance_level: 'high',
+          has_image: 'true',
+          image_key: imageKey,
+          source: 'feishu_multimodal',
+          sender,
+          chat_id: chatId,
+          tags: [new Date().toISOString().slice(0, 10), 'multimodal', 'feishu'].join(','),
+        });
+
+        capturedImageKeys.add(imageKey);
+        api.logger.info(`memory-qdrant-v3: [多模态-自动] captured image+text: ${imageKey} "${(text || '').slice(0, 50)}"`);
+      } catch (err) {
+        api.logger.warn(`memory-qdrant-v3: message_received 多模态捕获失败: ${err.message}`);
       }
     });
   }
@@ -1113,7 +1499,8 @@ export default function register(api) {
       try {
         const maxChars = cfg.captureMaxChars || DEFAULT_CAPTURE_MAX_CHARS;
 
-        function extractText(msg) {
+        // 向后兼容的纯文本提取（用于 assistant 消息）
+        function extractTextOnly(msg) {
           if (!msg || typeof msg !== 'object') return '';
           const content = msg.content;
           if (typeof content === 'string') return content;
@@ -1136,8 +1523,11 @@ export default function register(api) {
 
         if (lastUserIdx === -1) return;
 
-        const rawUserText = extractText(event.messages[lastUserIdx]).trim();
-        let userText = rawUserText
+        // 用 extractContent 提取文本和图片
+        const userContent = extractContent(event.messages[lastUserIdx]);
+        const hasImages = userContent.imageKeys.length > 0;
+
+        let userText = userContent.texts.join('\n').trim()
           .replace(/<relevant-memories>[\s\S]*?<\/relevant-memories>\s*/g, '');
 
         const lastBacktickIdx = userText.lastIndexOf('```');
@@ -1154,11 +1544,64 @@ export default function register(api) {
         let assistantText = '';
         for (let j = lastUserIdx + 1; j < event.messages.length; j++) {
           if (event.messages[j]?.role === 'assistant') {
-            assistantText = extractText(event.messages[j]).trim();
+            assistantText = extractTextOnly(event.messages[j]).trim();
             break;
           }
         }
 
+        // ---- 多模态管道：图文消息 → 融合向量 → multimodal_memories ----
+        if (hasImages && multimodalEnabled && mmDb && feishuAppId && feishuAppSecret) {
+          const imageKey = userContent.imageKeys[0];
+
+          // 如果 message_received 已经捕获了这张图，跳过多模态管道
+          if (capturedImageKeys.has(imageKey)) {
+            api.logger.info(`memory-qdrant-v3: image ${imageKey} 已被 message_received 捕获，跳过`);
+            // 不 return，继续走纯文本管道存储对话
+          } else {
+          try {
+            const token = await getFeishuTenantToken(feishuAppId, feishuAppSecret);
+
+            // 下载第一张图片（通常一条消息只含一张包包图）
+            if (userContent.imageKeys.length > 1) {
+              api.logger.info(`memory-qdrant-v3: 消息含 ${userContent.imageKeys.length} 张图，仅处理第一张`);
+            }
+            const imageData = await downloadFeishuImage(imageKey, token, api.logger);
+
+            if (imageData) {
+              const mmText = userText || assistantText || '';
+              const vector = await embeddings.embedMultimodal({
+                text: mmText || undefined,
+                image: imageData,
+              });
+
+              // 去重检查
+              const existing = await mmDb.search(vector, 1, SIMILARITY_THRESHOLDS.DUPLICATE);
+              if (existing.length === 0) {
+                await mmDb.store({
+                  text: mmText || `[图片] ${imageKey}`,
+                  vector,
+                  category: 'multimodal',
+                  importance: 0.9,
+                  importance_level: 'high',
+                  has_image: 'true',
+                  image_key: imageKey,
+                  source: 'feishu_multimodal',
+                  tags: [new Date().toISOString().slice(0, 10), 'multimodal', 'feishu'].join(','),
+                });
+                api.logger.info(`memory-qdrant-v3: [多模态] captured image+text: ${(mmText || imageKey).slice(0, 60)}...`);
+                return; // 多模态已存储，跳过纯文本管道
+              }
+            } else {
+              api.logger.warn(`memory-qdrant-v3: 图片下载失败 ${imageKey}，降级为纯文本`);
+              // 降级：没有图片就走纯文本流程（下方继续执行）
+            }
+          } catch (mmErr) {
+            api.logger.warn(`memory-qdrant-v3: multimodal capture 失败: ${mmErr.message}`);
+          }
+          } // close else (capturedImageKeys check)
+        }
+
+        // ---- 纯文本管道（原有流程）----
         if (!userText || userText.length < 2) return;
         if (isSystemMessage(userText)) return;
 

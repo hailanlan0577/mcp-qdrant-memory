@@ -52,6 +52,19 @@
       "dashscopeApiKey": {
         "type": "string",
         "description": "阿里云 DashScope API Key（也可通过 DASHSCOPE_API_KEY 环境变量设置）"
+      },
+      "feishuAppId": {
+        "type": "string",
+        "description": "飞书应用 App ID（多模态图片下载需要，也可通过 FEISHU_APP_ID 环境变量设置）"
+      },
+      "feishuAppSecret": {
+        "type": "string",
+        "description": "飞书应用 App Secret（也可通过 FEISHU_APP_SECRET 环境变量设置）"
+      },
+      "multimodalEnabled": {
+        "type": "boolean",
+        "default": false,
+        "description": "启用多模态融合向量（图文消息自动生成融合向量存入 multimodal_memories）"
       }
     }
   }
