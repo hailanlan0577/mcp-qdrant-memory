@@ -31,7 +31,7 @@ const EMBEDDING_MODEL = 'text-embedding-v4';
 const EMBEDDING_API_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings';
 
 // 多模态融合向量
-const MULTIMODAL_MODEL = 'tongyi-embedding-vision-plus-2026-03-06';
+const MULTIMODAL_MODEL = 'qwen3-vl-embedding';
 const MULTIMODAL_API_URL = 'https://dashscope.aliyuncs.com/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding';
 const MULTIMODAL_DIM = 1024;
 const MULTIMODAL_COLLECTION = 'multimodal_memories';

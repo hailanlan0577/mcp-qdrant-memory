@@ -1004,6 +1004,21 @@ def compact_conversations(before_days: int = 7, dry_run: bool = True) -> str:
 # ── memory_stats 缓存 ────────────────────────────────
 _stats_cache: dict = {"result": None, "expires": 0}
 _STATS_TTL = 60  # 缓存60秒
+_KNOWN_CATEGORIES = [
+    "conversation", "general", "project", "preference", "solution",
+    "architecture", "debug", "feedback", "decision", "summary", "fact",
+]
+_KNOWN_IMPORTANCES = ["high", "medium", "low"]
+
+
+def _count_filtered(key: str, value: str) -> int:
+    """用 Qdrant count API 按单个字段值计数（O(1)，无需遍历）。"""
+    result = client.count(
+        collection_name=COLLECTION_NAME,
+        count_filter=Filter(must=[FieldCondition(key=key, match=MatchValue(value=value))]),
+        exact=True,
+    )
+    return result.count
 
 
 @mcp.tool()
@@ -1020,39 +1035,49 @@ def memory_stats(force_refresh: bool = False) -> str:
     info = client.get_collection(collection_name=COLLECTION_NAME)
     total = info.points_count
 
-    categories = {}
-    importances = {"high": 0, "medium": 0, "low": 0}
-    v1_count = 0
+    # 并行计数：分类 + 重要性（每个 count API 调用都是 O(1)）
+    categories: dict[str, int] = {}
+    importances: dict[str, int] = {}
+    results_lock = threading.Lock()
 
-    offset = None
-    while True:
-        points, offset = client.scroll(
-            collection_name=COLLECTION_NAME,
-            limit=100,
-            offset=offset,
-            with_payload=True,
-        )
-        if not points:
-            break
-        for p in points:
-            cat = p.payload.get("category", "unknown")
-            categories[cat] = categories.get(cat, 0) + 1
-            imp = p.payload.get("importance")
-            if imp:
-                importances[imp] = importances.get(imp, 0) + 1
-            else:
-                v1_count += 1
-        if offset is None:
-            break
+    def count_category(cat: str) -> None:
+        c = _count_filtered("category", cat)
+        if c > 0:
+            with results_lock:
+                categories[cat] = c
+
+    def count_importance(imp: str) -> None:
+        c = _count_filtered("importance", imp)
+        with results_lock:
+            importances[imp] = c
+
+    threads = []
+    for cat in _KNOWN_CATEGORIES:
+        t = threading.Thread(target=count_category, args=(cat,))
+        threads.append(t)
+        t.start()
+    for imp in _KNOWN_IMPORTANCES:
+        t = threading.Thread(target=count_importance, args=(imp,))
+        threads.append(t)
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    categorized_total = sum(categories.values())
+    uncategorized = total - categorized_total
+    importance_total = sum(importances.values())
+    v1_count = total - importance_total
 
     lines = [f"总记忆数: {total}"]
     lines.append("\n按分类:")
     for cat, count in sorted(categories.items(), key=lambda x: -x[1]):
         lines.append(f"  {cat}: {count}")
+    if uncategorized > 0:
+        lines.append(f"  其他: {uncategorized}")
     lines.append("\n按重要性:")
-    for imp in ["high", "medium", "low"]:
-        lines.append(f"  {imp}: {importances[imp]}")
-    if v1_count:
+    for imp in _KNOWN_IMPORTANCES:
+        lines.append(f"  {imp}: {importances.get(imp, 0)}")
+    if v1_count > 0:
         lines.append(f"  未分级(v1): {v1_count}")
 
     result = "\n".join(lines)
