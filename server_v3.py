@@ -1,13 +1,13 @@
 """
 Qdrant Memory MCP Server V3
-基于 V2.1，升级 embedding 模型：
-  bge-small-zh-v1.5 (512维, 本地) → text-embedding-v4 (1024维, 阿里云API)
+Collection: unified_memories_v3 | Embedding: 阿里云 text-embedding-v4 (1024维)
 
-改进：
-- 语义理解大幅提升（大模型级别 vs 小模型）
-- 长文本支持 8192 Token（原 512）
-- 支持 query/document 区分优化检索
-- 新 collection claude-memory-v3，不影响旧数据
+特性：
+- 语义理解：大模型级 embedding，中文表现优异
+- 长文本支持：8192 Token
+- query/document 区分优化检索准确度
+- 10s 超时 + 指数退避重试（最多 2 次）
+- memory_stats 用 Qdrant count API 并行计数
 """
 
 import os

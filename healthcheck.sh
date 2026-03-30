@@ -189,9 +189,74 @@ else
     check "Graphiti search_nodes" "fail" "隧道不通，跳过"
 fi
 
-# ── 6. 技术文档 ──────────────────────────────
+# ── 6. 记忆统计健康度 ───────────────────────
 echo ""
-echo "📄 6. 技术文档"
+echo "📊 6. 记忆统计健康度"
+
+STATS_JSON=$(python3 -c "
+import httpx, json
+try:
+    c = httpx.Client(timeout=10, trust_env=False)
+    r = c.post('http://localhost:6333/collections/unified_memories_v3/points/count',
+        json={'exact': True}, headers={'Content-Type': 'application/json'})
+    total = r.json()['result']['count']
+    r2 = c.post('http://localhost:6333/collections/unified_memories_v3/points/count',
+        json={'filter': {'must': [{'key': 'category', 'match': {'value': 'conversation'}}]}, 'exact': True},
+        headers={'Content-Type': 'application/json'})
+    conv = r2.json()['result']['count']
+    pct = round(conv / total * 100) if total > 0 else 0
+    print(f'{total},{conv},{pct}')
+except: print('0,0,0')
+" 2>/dev/null)
+IFS=',' read -r TOTAL CONV PCT <<< "$STATS_JSON"
+if [[ $TOTAL -gt 0 ]]; then
+    check "记忆总量: ${TOTAL} 条" "ok"
+    if [[ $PCT -gt 60 ]]; then
+        check "conversation 占比 ${PCT}%" "warn" "超过 60%，建议运行 compact_conversations"
+    else
+        check "conversation 占比 ${PCT}%" "ok"
+    fi
+else
+    check "记忆统计" "fail" "无法读取记忆数据"
+fi
+
+# ── 7. Embedding API 可用性 ─────────────────
+echo ""
+echo "🔑 7. Embedding API"
+
+EMBED_OK=$(python3 -c "
+import httpx, os
+try:
+    key = os.environ.get('DASHSCOPE_API_KEY', '')
+    if not key: print('nokey'); exit()
+    r = httpx.post('https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings',
+        headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'},
+        json={'model': 'text-embedding-v4', 'input': 'test', 'dimensions': 1024},
+        timeout=10)
+    print('ok' if r.status_code == 200 else 'fail')
+except: print('fail')
+" 2>/dev/null)
+check "DashScope Embedding API" "$EMBED_OK" "检查 DASHSCOPE_API_KEY 或网络连接"
+
+# ── 8. 备份新鲜度 ──────────────────────────
+echo ""
+echo "💾 8. 备份新鲜度"
+
+LATEST_BACKUP=$(ls -t "$HOME/backups"/macbookpro-backup-*.tar.gz 2>/dev/null | head -1)
+if [[ -n "$LATEST_BACKUP" ]]; then
+    BACKUP_AGE=$(( ($(date +%s) - $(stat -f %m "$LATEST_BACKUP")) / 3600 ))
+    if [[ $BACKUP_AGE -le 48 ]]; then
+        check "最近备份: ${BACKUP_AGE}h 前" "ok"
+    else
+        check "最近备份: ${BACKUP_AGE}h 前" "warn" "超过 48 小时未备份，运行 bash ~/backups/backup-macbookpro.sh"
+    fi
+else
+    check "MacBook Pro 备份" "fail" "未找到任何备份"
+fi
+
+# ── 9. 技术文档 ──────────────────────────────
+echo ""
+echo "📄 9. 技术文档"
 
 DOC_FILE="$HOME/.claude/docs/memory-system.md"
 if [[ -f "$DOC_FILE" ]]; then
