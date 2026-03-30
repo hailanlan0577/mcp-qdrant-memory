@@ -85,33 +85,49 @@ GRAPHITI_BASE = "http://localhost:18001"
 GRAPHITI_MCP_URL = f"{GRAPHITI_BASE}/mcp"
 
 # ── Embedding 客户端 ─────────────────────────────────
-_http_client = httpx.Client(timeout=30)
+_http_client = httpx.Client(timeout=10)  # 单次请求 10s 超时
+
+_EMBED_MAX_RETRIES = 2
+_EMBED_BACKOFF_BASE = 1.0  # 首次重试等 1s，第二次等 2s
 
 
 def get_embedding(text: str, text_type: str = "document") -> list[float]:
-    """调用阿里云 text-embedding-v4 生成向量。
+    """调用阿里云 text-embedding-v4 生成向量（带指数退避重试）。
 
     Args:
         text: 输入文本
         text_type: "query" 用于搜索查询，"document" 用于存储文档
+    Raises:
+        RuntimeError: 重试耗尽后仍失败
     """
-    resp = _http_client.post(
-        EMBEDDING_API_URL,
-        headers={
-            "Authorization": f"Bearer {DASHSCOPE_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": EMBEDDING_MODEL,
-            "input": text,
-            "dimensions": VECTOR_DIM,
-            "encoding_format": "float",
-            "extra_body": {"text_type": text_type},
-        },
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    return data["data"][0]["embedding"]
+    last_err: Exception | None = None
+    for attempt in range(_EMBED_MAX_RETRIES + 1):
+        try:
+            resp = _http_client.post(
+                EMBEDDING_API_URL,
+                headers={
+                    "Authorization": f"Bearer {DASHSCOPE_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": EMBEDDING_MODEL,
+                    "input": text,
+                    "dimensions": VECTOR_DIM,
+                    "encoding_format": "float",
+                    "extra_body": {"text_type": text_type},
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data["data"][0]["embedding"]
+        except Exception as e:
+            last_err = e
+            if attempt < _EMBED_MAX_RETRIES:
+                wait = _EMBED_BACKOFF_BASE * (2 ** attempt)
+                import logging as _log
+                _log.warning(f"[get_embedding] 第{attempt+1}次失败: {e}, {wait}s 后重试")
+                time.sleep(wait)
+    raise RuntimeError(f"Embedding API 重试{_EMBED_MAX_RETRIES}次后仍失败: {last_err}")
 
 
 # ── Qdrant 初始化 ────────────────────────────────────
