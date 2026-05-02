@@ -5,16 +5,29 @@
 
 import hashlib
 import json
+import os
 import time
 import urllib.request
 import urllib.error
 
+# Embedding backend 切换:
+#   local (默认): 本地 MLX daemon, 4096 维
+#   dashscope   : 阿里云 v4, 1024 维
+EMBED_BACKEND = os.environ.get("EMBED_BACKEND", "local").lower()
+
 QDRANT_URL = "http://localhost:6333"
 OLD_COLLECTION = "openclaw_memories"
 NEW_COLLECTION = "openclaw_memories_v3"
-VECTOR_DIM = 1024
 
-DASHSCOPE_API_KEY = "sk-0da94cd0218b4224aaebc5cf4a24c39f"
+if EMBED_BACKEND == "local":
+    VECTOR_DIM = 4096
+elif EMBED_BACKEND == "dashscope":
+    VECTOR_DIM = 1024
+else:
+    raise ValueError(f"未知 EMBED_BACKEND: {EMBED_BACKEND}")
+
+LOCAL_EMBED_URL = os.environ.get("LOCAL_EMBED_URL", "http://127.0.0.1:8765/embed")
+DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "sk-0da94cd0218b4224aaebc5cf4a24c39f")
 EMBEDDING_MODEL = "text-embedding-v4"
 EMBEDDING_API_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings"
 
@@ -29,6 +42,12 @@ def qdrant_request(method, path, body=None):
 
 
 def get_embedding(text):
+    if EMBED_BACKEND == "local":
+        data = json.dumps({"text": text, "text_type": "document"}).encode()
+        req = urllib.request.Request(LOCAL_EMBED_URL, data=data, method="POST")
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read())["embedding"]
     data = json.dumps({
         "model": EMBEDDING_MODEL,
         "input": text,

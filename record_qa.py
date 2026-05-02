@@ -19,9 +19,22 @@ from datetime import datetime, timezone
 
 import httpx
 
+# Embedding backend 切换:
+#   local (默认): 本地 MLX daemon, 4096 维, collection=unified_memories_v3_local
+#   dashscope   : 阿里云 v4, 1024 维, collection=unified_memories_v3
+EMBED_BACKEND = os.environ.get("EMBED_BACKEND", "local").lower()
+
+if EMBED_BACKEND == "local":
+    VECTOR_DIM = 4096
+    COLLECTION_NAME = "unified_memories_v3_local"
+elif EMBED_BACKEND == "dashscope":
+    VECTOR_DIM = 1024
+    COLLECTION_NAME = "unified_memories_v3"
+else:
+    raise ValueError(f"未知 EMBED_BACKEND: {EMBED_BACKEND}, 必须是 'local' 或 'dashscope'")
+
 QDRANT_URL = "http://localhost:6333"
-COLLECTION_NAME = "unified_memories_v3"
-VECTOR_DIM = 1024
+LOCAL_EMBED_URL = os.environ.get("LOCAL_EMBED_URL", "http://127.0.0.1:8765/embed")
 DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "sk-0da94cd0218b4224aaebc5cf4a24c39f")
 EMBEDDING_API_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings"
 
@@ -29,6 +42,10 @@ _client = httpx.Client(timeout=30, trust_env=False)
 
 
 def get_embedding(text: str) -> list[float]:
+    if EMBED_BACKEND == "local":
+        resp = _client.post(LOCAL_EMBED_URL, json={"text": text[:8000], "text_type": "document"})
+        resp.raise_for_status()
+        return resp.json()["embedding"]
     resp = _client.post(
         EMBEDDING_API_URL,
         headers={"Authorization": f"Bearer {DASHSCOPE_API_KEY}", "Content-Type": "application/json"},

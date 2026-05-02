@@ -6,7 +6,7 @@ Collection: unified_memories_v3 | Embedding: 阿里云 text-embedding-v4 (1024�
 - 语义理解：大模型级 embedding，中文表现优异
 - 长文本支持：8192 Token
 - query/document 区分优化检索准确度
-- 10s 超时 + 指数退避重试（最多 2 次）
+- 30s 超时 + 指数退避重试（最多 2 次）
 - memory_stats 用 Qdrant count API 并行计数
 """
 
@@ -42,17 +42,35 @@ from qdrant_client.models import (
 # ── 配置 ──────────────────────────────────────────────
 QDRANT_URL = "http://localhost:6333"
 _TEST_MODE = "--test" in sys.argv
-COLLECTION_NAME = "unified_memories_v3_test" if _TEST_MODE else "unified_memories_v3"
-VECTOR_DIM = 1024
 
+# Embedding backend 切换:
+#   "dashscope" (默认): 阿里云 text-embedding-v4, 1024 维, collection=unified_memories_v3
+#   "local"          : 本地 MLX daemon (Qwen3-VL-Embedding-8B), 4096 维, collection=unified_memories_v3_local
+EMBED_BACKEND = os.environ.get("EMBED_BACKEND", "dashscope").lower()
+
+if EMBED_BACKEND == "local":
+    VECTOR_DIM = 4096
+    _BASE_COLLECTION = "unified_memories_v3_local"
+elif EMBED_BACKEND == "dashscope":
+    VECTOR_DIM = 1024
+    _BASE_COLLECTION = "unified_memories_v3"
+else:
+    raise ValueError(f"未知的 EMBED_BACKEND: {EMBED_BACKEND}, 必须是 'dashscope' 或 'local'")
+
+COLLECTION_NAME = f"{_BASE_COLLECTION}_test" if _TEST_MODE else _BASE_COLLECTION
+
+import logging as _log
+_log.warning(f"[server_v3] EMBED_BACKEND={EMBED_BACKEND} | VECTOR_DIM={VECTOR_DIM} | COLLECTION={COLLECTION_NAME}")
 if _TEST_MODE:
-    import logging as _log
-    _log.warning(f"[server_v3] ⚠️  TEST MODE: 使用测试集合 {COLLECTION_NAME}")
+    _log.warning(f"[server_v3] ⚠️  TEST MODE")
 
-# 阿里云百炼 Embedding API
+# 阿里云百炼 Embedding API (backend=dashscope 时用)
 DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
 EMBEDDING_MODEL = "text-embedding-v4"
 EMBEDDING_API_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings"
+
+# 本地 MLX Embedding Daemon (backend=local 时用)
+LOCAL_EMBED_URL = os.environ.get("LOCAL_EMBED_URL", "http://127.0.0.1:8765/embed")
 
 # importance 权重
 IMPORTANCE_WEIGHTS = {
@@ -73,7 +91,7 @@ CATEGORY_IMPORTANCE = {
     "fact": "medium",
     "general": "medium",
     "other": "low",
-    "conversation": "low",
+    "conversation": "medium",  # 从 low 提升：hook 写入的会话记录不应被过度降权
     "summary": "high",
 }
 
@@ -91,43 +109,57 @@ _EMBED_MAX_RETRIES = 2
 _EMBED_BACKOFF_BASE = 1.0  # 首次重试等 1s，第二次等 2s
 
 
+def _get_embedding_dashscope(text: str, text_type: str) -> list[float]:
+    """调用阿里云 text-embedding-v4(1024 维)。"""
+    resp = _http_client.post(
+        EMBEDDING_API_URL,
+        headers={
+            "Authorization": f"Bearer {DASHSCOPE_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": EMBEDDING_MODEL,
+            "input": text,
+            "dimensions": VECTOR_DIM,
+            "encoding_format": "float",
+            "extra_body": {"text_type": text_type},
+        },
+    )
+    resp.raise_for_status()
+    return resp.json()["data"][0]["embedding"]
+
+
+def _get_embedding_local(text: str, text_type: str) -> list[float]:
+    """调用本地 MLX daemon(Qwen3-VL-Embedding-8B, 4096 维)。"""
+    resp = _http_client.post(
+        LOCAL_EMBED_URL,
+        json={"text": text, "text_type": text_type},
+    )
+    resp.raise_for_status()
+    return resp.json()["embedding"]
+
+
 def get_embedding(text: str, text_type: str = "document") -> list[float]:
-    """调用阿里云 text-embedding-v4 生成向量（带指数退避重试）。
+    """生成 embedding 向量(带指数退避重试)。按 EMBED_BACKEND 路由到本地或云端。
 
     Args:
         text: 输入文本
-        text_type: "query" 用于搜索查询，"document" 用于存储文档
+        text_type: "query" 用于搜索查询, "document" 用于存储文档
     Raises:
         RuntimeError: 重试耗尽后仍失败
     """
+    impl = _get_embedding_local if EMBED_BACKEND == "local" else _get_embedding_dashscope
     last_err: Exception | None = None
     for attempt in range(_EMBED_MAX_RETRIES + 1):
         try:
-            resp = _http_client.post(
-                EMBEDDING_API_URL,
-                headers={
-                    "Authorization": f"Bearer {DASHSCOPE_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": EMBEDDING_MODEL,
-                    "input": text,
-                    "dimensions": VECTOR_DIM,
-                    "encoding_format": "float",
-                    "extra_body": {"text_type": text_type},
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return data["data"][0]["embedding"]
+            return impl(text, text_type)
         except Exception as e:
             last_err = e
             if attempt < _EMBED_MAX_RETRIES:
                 wait = _EMBED_BACKOFF_BASE * (2 ** attempt)
-                import logging as _log
-                _log.warning(f"[get_embedding] 第{attempt+1}次失败: {e}, {wait}s 后重试")
+                _log.warning(f"[get_embedding/{EMBED_BACKEND}] 第{attempt+1}次失败: {e}, {wait}s 后重试")
                 time.sleep(wait)
-    raise RuntimeError(f"Embedding API 重试{_EMBED_MAX_RETRIES}次后仍失败: {last_err}")
+    raise RuntimeError(f"Embedding({EMBED_BACKEND}) 重试 {_EMBED_MAX_RETRIES} 次后仍失败: {last_err}")
 
 
 # ── Qdrant 初始化 ────────────────────────────────────
@@ -173,11 +205,15 @@ def ensure_collection():
             pass
 
 
-try:
-    ensure_collection()
-except Exception as _e:
-    import logging as _logging
-    _logging.warning(f"[server_v3] ensure_collection failed at startup (Qdrant not ready?): {_e}")
+# 后台初始化 collection，不阻塞 MCP 启动（Cloudflare Tunnel 可能慢/超时）
+def _init_collection_background():
+    try:
+        ensure_collection()
+    except Exception as _e:
+        import logging as _logging
+        _logging.warning(f"[server_v3] ensure_collection failed at startup (Qdrant not ready?): {_e}")
+
+threading.Thread(target=_init_collection_background, daemon=True).start()
 
 mcp = FastMCP(
     "Claude Memory V3",
@@ -211,6 +247,11 @@ mcp = FastMCP(
 
 def make_id(content: str) -> str:
     return hashlib.md5(content.encode()).hexdigest()
+
+
+def _contains_chinese(text: str) -> bool:
+    """检测文本是否包含中文字符。"""
+    return any('\u4e00' <= c <= '\u9fff' for c in text)
 
 
 def get_importance(category: str) -> str:
@@ -319,6 +360,27 @@ def store_memory(content: str, category: str = "general", tags: str = "", source
             )
         ],
     )
+
+    # 双写 Graphiti (异步入队,失败不影响 Qdrant 已写入)
+    # 只对高价值类别(非 conversation/general/other)写入,避免图谱噪音
+    if category not in ("conversation", "general", "other"):
+        try:
+            preview = content[:80].replace("\n", " ")
+            name = f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] [{category}] {preview}"
+            call_graphiti_tool(
+                "add_memory",
+                {
+                    "name": name[:200],
+                    "episode_body": content[:4000],
+                    "group_id": "claude_code",
+                    "source": "text",
+                    "source_description": f"store_memory ({category})",
+                },
+                timeout=10,
+            )
+        except Exception as e:
+            _log.warning(f"[store_memory] Graphiti 双写失败(不影响 Qdrant): {e}")
+
     return f"记忆已存储 [ID: {memory_id[:8]}] 分类: {category} 重要性: {importance}"
 
 
@@ -449,6 +511,25 @@ def keyword_search(keyword: str, category: str = "", limit: int = 5) -> str:
         limit=fetch_limit,
         with_payload=True,
     )
+
+    # 中文子串回退：MatchText 按空格/标点分词，无空格中文会被当成整体 token，
+    # 导致"不再受权限影响"匹配不到"不再受 iCloud 权限影响"。
+    # 用 Python 侧子串匹配补充。
+    if _contains_chinese(keyword) and len(results) < fetch_limit:
+        existing_ids = {p.id for p in results}
+        cat_filter = Filter(must=must_conditions) if must_conditions else None
+        scan_points, _ = client.scroll(
+            collection_name=COLLECTION_NAME,
+            scroll_filter=cat_filter,
+            limit=2000,
+            with_payload=True,
+        )
+        for p in scan_points:
+            if p.id not in existing_ids:
+                content = p.payload.get("content", "")
+                tags = p.payload.get("tags", "")
+                if keyword in content or keyword in tags:
+                    results.append(p)
 
     if not results:
         return f"没有找到包含 '{keyword}' 的记忆。"
@@ -621,27 +702,34 @@ def list_memories(category: str = "", limit: int = 10) -> str:
     return "\n\n".join(memories)
 
 
+OPENCLAW_QDRANT_URL = "http://localhost:26333"
+
+
 @mcp.tool()
 def search_openclaw_memory(keyword: str) -> str:
-    """在 unified_memories_v3 中搜索 OpenClaw 的记忆（source=openclaw）。
+    """通过 SSH 隧道按需搜索 Mac Mini 上 OpenClaw 的记忆（source=openclaw）。
 
     Args:
         keyword: 要搜索的关键词（支持多语言）
     """
-    results, _ = client.scroll(
-        collection_name=COLLECTION_NAME,
-        scroll_filter=Filter(
-            must=[
-                FieldCondition(key="source", match=MatchValue(value="openclaw")),
-                FieldCondition(key="content", match=MatchText(text=keyword)),
-            ]
-        ),
-        limit=5,
-        with_payload=True,
-    )
+    try:
+        openclaw_client = QdrantClient(url=OPENCLAW_QDRANT_URL, timeout=10)
+        results, _ = openclaw_client.scroll(
+            collection_name=COLLECTION_NAME,
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(key="source", match=MatchValue(value="openclaw")),
+                    FieldCondition(key="content", match=MatchText(text=keyword)),
+                ]
+            ),
+            limit=5,
+            with_payload=True,
+        )
+    except Exception as e:
+        return f"无法连接 Mac Mini Qdrant（{OPENCLAW_QDRANT_URL}）：{e}\n提示：检查 SSH 隧道 26333→macmini:6333 是否正常。"
 
     if not results:
-        return f"在 unified_memories_v3 (source=openclaw) 中没有找到包含 '{keyword}' 的记忆。"
+        return f"在 Mac Mini (source=openclaw) 中没有找到包含 '{keyword}' 的记忆。"
 
     memories = []
     for point in results:
@@ -838,8 +926,8 @@ def hybrid_search(query: str, top_k: int = 5) -> str:
     def search_graphiti_batch():
         nonlocal graphiti_nodes_text, graphiti_facts_text
         results = call_graphiti_tools_batch([
-            ("search_nodes", {"query": query, "group_ids": ["claude_code", "openclaw"]}),
-            ("search_memory_facts", {"query": query, "group_ids": ["claude_code", "openclaw"]}),
+            ("search_nodes", {"query": query, "group_ids": ["claude_code"]}),
+            ("search_memory_facts", {"query": query, "group_ids": ["claude_code"]}),
         ], timeout=15)
         graphiti_nodes_text = parse_graphiti_text(results.get("search_nodes"))
         graphiti_facts_text = parse_graphiti_text(results.get("search_memory_facts"))
@@ -1117,11 +1205,11 @@ def global_search(query: str, top_k: int = 5) -> str:
     claude_scored: list = []
     openclaw_scored: list = []
 
-    def search_source(source: str, out: list):
+    def search_local(out: list):
         results = client.query_points(
             collection_name=COLLECTION_NAME,
             query=embedding,
-            query_filter=Filter(must=[FieldCondition(key="source", match=MatchValue(value=source))]),
+            query_filter=Filter(must=[FieldCondition(key="source", match=MatchValue(value="claude_code"))]),
             limit=fetch_k,
             with_payload=True,
         )
@@ -1131,7 +1219,7 @@ def global_search(query: str, top_k: int = 5) -> str:
             ts = payload.get("timestamp", 0)
             w_score = weighted_score(point.score, importance, ts)
             out.append({
-                "source": source,
+                "source": "claude_code",
                 "raw_score": point.score,
                 "weighted_score": w_score,
                 "importance": importance,
@@ -1141,8 +1229,36 @@ def global_search(query: str, top_k: int = 5) -> str:
                 "created_at": payload.get("created_at", "")[:10],
             })
 
-    t1 = threading.Thread(target=search_source, args=("claude_code", claude_scored))
-    t2 = threading.Thread(target=search_source, args=("openclaw", openclaw_scored))
+    def search_remote(out: list):
+        try:
+            remote = QdrantClient(url=OPENCLAW_QDRANT_URL, timeout=10)
+            results = remote.query_points(
+                collection_name=COLLECTION_NAME,
+                query=embedding,
+                query_filter=Filter(must=[FieldCondition(key="source", match=MatchValue(value="openclaw"))]),
+                limit=fetch_k,
+                with_payload=True,
+            )
+            for point in results.points:
+                payload = point.payload
+                importance = payload.get("importance", "medium")
+                ts = payload.get("timestamp", 0)
+                w_score = weighted_score(point.score, importance, ts)
+                out.append({
+                    "source": "openclaw",
+                    "raw_score": point.score,
+                    "weighted_score": w_score,
+                    "importance": importance,
+                    "content": payload.get("content", ""),
+                    "category": payload.get("category", ""),
+                    "tags": payload.get("tags", ""),
+                    "created_at": payload.get("created_at", "")[:10],
+                })
+        except Exception:
+            pass  # Mac Mini 不可达时静默跳过
+
+    t1 = threading.Thread(target=search_local, args=(claude_scored,))
+    t2 = threading.Thread(target=search_remote, args=(openclaw_scored,))
     t1.start(); t2.start()
     t1.join(timeout=15); t2.join(timeout=15)
 

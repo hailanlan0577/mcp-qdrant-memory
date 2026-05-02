@@ -20,8 +20,25 @@ import httpx
 from qdrant_client import QdrantClient
 from qdrant_client.models import FieldCondition, Filter, MatchValue, PointStruct, Range
 
+# Embedding backend 切换:
+#   local (默认): 本地 MLX daemon, 4096 维, collection=unified_memories_v3_local
+#   dashscope   : 阿里云 v4, 1024 维, collection=unified_memories_v3
+EMBED_BACKEND = os.environ.get("EMBED_BACKEND", "local").lower()
+_IS_PROD = "--prod" in sys.argv
+
 QDRANT_URL = "http://localhost:6333"
-COLLECTION_NAME = "unified_memories_v3" if "--prod" in sys.argv else "unified_memories_v3_test"
+LOCAL_EMBED_URL = os.environ.get("LOCAL_EMBED_URL", "http://127.0.0.1:8765/embed")
+
+if not _IS_PROD:
+    # 测试模式始终用老 1024 维测试集合(避免污染 local)
+    COLLECTION_NAME = "unified_memories_v3_test"
+elif EMBED_BACKEND == "local":
+    COLLECTION_NAME = "unified_memories_v3_local"
+elif EMBED_BACKEND == "dashscope":
+    COLLECTION_NAME = "unified_memories_v3"
+else:
+    raise ValueError(f"未知 EMBED_BACKEND: {EMBED_BACKEND}")
+
 DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
 DASHSCOPE_EMBED_URL = "https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding"
 
@@ -31,6 +48,10 @@ def make_id(content: str) -> str:
 
 
 def get_embedding(text: str) -> list[float]:
+    if EMBED_BACKEND == "local":
+        resp = httpx.post(LOCAL_EMBED_URL, json={"text": text, "text_type": "document"}, timeout=30)
+        resp.raise_for_status()
+        return resp.json()["embedding"]
     resp = httpx.post(
         DASHSCOPE_EMBED_URL,
         headers={"Authorization": f"Bearer {DASHSCOPE_API_KEY}", "Content-Type": "application/json"},
@@ -42,7 +63,7 @@ def get_embedding(text: str) -> list[float]:
 
 
 def compact(before_days: int = 30, dry_run: bool = True):
-    if not dry_run and not DASHSCOPE_API_KEY:
+    if not dry_run and EMBED_BACKEND == "dashscope" and not DASHSCOPE_API_KEY:
         print("ERROR: DASHSCOPE_API_KEY 未设置，无法生成摘要 embedding")
         sys.exit(1)
 
